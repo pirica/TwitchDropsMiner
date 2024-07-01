@@ -30,13 +30,19 @@ if sys.platform == "win32":
 
 from translate import _
 from cache import ImageCache
-from exceptions import ExitRequest
+from exceptions import MinerException, ExitRequest
 from utils import resource_path, set_root_icon, webopen, Game, _T
 from constants import (
-    SELF_PATH, OUTPUT_FORMATTER, WS_TOPICS_LIMIT, MAX_WEBSOCKETS, WINDOW_TITLE, State
+    SELF_PATH,
+    WINDOW_TITLE,
+    LOGGING_LEVELS,
+    MAX_WEBSOCKETS,
+    WS_TOPICS_LIMIT,
+    OUTPUT_FORMATTER,
+    State,
 )
 if sys.platform == "win32":
-    from registry import RegistryKey, ValueType
+    from registry import RegistryKey, ValueType, ValueNotFound
 
 
 if TYPE_CHECKING:
@@ -700,6 +706,9 @@ class CampaignProgress:
             self._timer_task.cancel()
             self._timer_task = None
 
+    def is_counting(self) -> bool:
+        return self._timer_task is not None
+
     def display(self, drop: TimedDrop | None, *, countdown: bool = True, subone: bool = False):
         self._drop = drop
         vars_drop = self._vars["drop"]
@@ -1035,24 +1044,52 @@ class TrayIcon:
     def __init__(self, manager: GUIManager, master: ttk.Widget):
         self._manager = manager
         self.icon: pystray.Icon | None = None
-        self.icon_image = Image_module.open(resource_path("pickaxe.ico"))
+        self._icon_images: dict[str, Image_module.Image] = {
+            "pickaxe": Image_module.open(resource_path("icons/pickaxe.ico")),
+            "active": Image_module.open(resource_path("icons/active.ico")),
+            "idle": Image_module.open(resource_path("icons/idle.ico")),
+            "error": Image_module.open(resource_path("icons/error.ico")),
+            "maint": Image_module.open(resource_path("icons/maint.ico")),
+        }
+        self._icon_state: str = "pickaxe"
         self._button = ttk.Button(master, command=self.minimize, text=_("gui", "tray", "minimize"))
         self._button.grid(column=0, row=0, sticky="ne")
 
     def __del__(self) -> None:
         self.stop()
-        self.icon_image.close()
+        for icon_image in self._icon_images.values():
+            icon_image.close()
+
+    def _shorten(self, text: str, by_len: int, min_len: int) -> str:
+        if (text_len := len(text)) <= min_len + 3 or by_len <= 0:
+            # cannot shorten
+            return text
+        return text[:-min(by_len + 3, text_len - min_len)] + "..."
 
     def get_title(self, drop: TimedDrop | None) -> str:
         if drop is None:
             return self.TITLE
         campaign = drop.campaign
-        return (
-            f"{self.TITLE}\n"
-            f"{campaign.game.name}\n"
-            f"{drop.rewards_text()} "
-            f"{drop.progress:.1%} ({campaign.claimed_drops}/{campaign.total_drops})"
-        )
+        title_parts: list[str] = [
+            f"{self.TITLE}\n",
+            f"{campaign.game.name}\n",
+            drop.rewards_text(),
+            f" {drop.progress:.1%} ({campaign.claimed_drops}/{campaign.total_drops})"
+        ]
+        min_len: int = 30
+        max_len: int = 127
+        missing_len = len(''.join(title_parts)) - max_len
+        if missing_len > 0:
+            # try shortening the reward text
+            title_parts[2] = self._shorten(title_parts[2], missing_len, min_len)
+            missing_len = len(''.join(title_parts)) - max_len
+        if missing_len > 0:
+            # try shortening the game name
+            title_parts[1] = self._shorten(title_parts[1], missing_len, min_len)
+            missing_len = len(''.join(title_parts)) - max_len
+        if missing_len > 0:
+            raise MinerException(f"Title couldn't be shortened: {''.join(title_parts)}")
+        return ''.join(title_parts)
 
     def _start(self):
         loop = asyncio.get_running_loop()
@@ -1067,7 +1104,9 @@ class TrayIcon:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(_("gui", "tray", "quit"), bridge(self.quit)),
         )
-        self.icon = pystray.Icon("twitch_miner", self.icon_image, self.get_title(drop), menu)
+        self.icon = pystray.Icon(
+            "twitch_miner", self._icon_images[self._icon_state], self.get_title(drop), menu
+        )
         # self.icon.run_detached()
         loop.run_in_executor(None, self.icon.run)
 
@@ -1112,6 +1151,13 @@ class TrayIcon:
     def update_title(self, drop: TimedDrop | None):
         if self.icon is not None:
             self.icon.title = self.get_title(drop)
+
+    def change_icon(self, state: str):
+        if state not in self._icon_images:
+            raise ValueError("Invalid icon state")
+        self._icon_state = state
+        if self.icon is not None:
+            self.icon.icon = self._icon_images[state]
 
 
 class Notebook:
@@ -1469,7 +1515,7 @@ class SettingsPanel:
         self._vars: _SettingsVars = {
             "proxy": StringVar(master, str(self._settings.proxy)),
             "tray": IntVar(master, self._settings.autostart_tray),
-            "autostart": IntVar(master, self._settings.autostart),
+            "autostart": IntVar(master, 0),
             "priority_only": IntVar(master, self._settings.priority_only),
             "tray_notifications": IntVar(master, self._settings.tray_notifications),
         }
@@ -1624,6 +1670,8 @@ class SettingsPanel:
             command=self._twitch.state_change(State.INVENTORY_FETCH),
         ).grid(column=1, row=0)
 
+        self._vars["autostart"].set(self._query_autostart())
+
     def clear_selection(self) -> None:
         self._priority_list.selection_clear(0, "end")
         self._exclude_list.selection_clear(0, "end")
@@ -1631,45 +1679,79 @@ class SettingsPanel:
     def update_notifications(self) -> None:
         self._settings.tray_notifications = bool(self._vars["tray_notifications"].get())
 
-    def _get_autostart_path(self, tray: bool) -> str:
-        self_path = f'"{SELF_PATH.resolve()!s}"'
-        if tray:
-            self_path += " --tray"
-        return self_path
+    def _get_self_path(self) -> str:
+        # NOTE: we need double quotes in case the path contains spaces
+        return f'"{SELF_PATH.resolve()!s}"'
+
+    def _get_autostart_path(self) -> str:
+        flags: list[str] = ['']  # this will add a space between self path and flags
+        # if non-zero, include the current logging level as well
+        if self._settings.logging_level > 0:
+            for lvl_idx, lvl_value in LOGGING_LEVELS.items():
+                if lvl_value == self._settings.logging_level:
+                    flags.append(f"-{'v' * lvl_idx}")
+                    break
+        if self._vars["tray"].get():
+            flags.append("--tray")
+        return self._get_self_path() + ' '.join(flags)
+
+    def _get_linux_autostart_filepath(self) -> Path:
+        autostart_folder: Path = Path("~/.config/autostart").expanduser()
+        if (config_home := os.environ.get("XDG_CONFIG_HOME")) is not None:
+            config_autostart: Path = Path(config_home, "autostart").expanduser()
+            if config_autostart.exists():
+                autostart_folder = config_autostart
+        return autostart_folder / f"{self.AUTOSTART_NAME}.desktop"
+
+    def _query_autostart(self) -> bool:
+        if sys.platform == "win32":
+            with RegistryKey(self.AUTOSTART_KEY, read_only=True) as key:
+                try:
+                    value_type, value = key.get(self.AUTOSTART_NAME)
+                except ValueNotFound:
+                    return False
+                if (
+                    value_type is not ValueType.REG_SZ
+                    or self._get_self_path() not in value
+                ):
+                    # TODO: Consider deleting the old value to avoid autostart errors
+                    return False
+            return True
+        elif sys.platform == "linux":
+            autostart_file: Path = self._get_linux_autostart_filepath()
+            if not autostart_file.exists():
+                return False
+            with autostart_file.open('r', encoding="utf8") as file:
+                # TODO: Consider deleting the old file to avoid autostart errors
+                return self._get_self_path() not in file.read()
 
     def update_autostart(self) -> None:
         enabled = bool(self._vars["autostart"].get())
-        tray = bool(self._vars["tray"].get())
-        self._settings.autostart = enabled
-        self._settings.autostart_tray = tray
+        self._settings.autostart_tray = bool(self._vars["tray"].get())
         if sys.platform == "win32":
             if enabled:
-                # NOTE: we need double quotes in case the path contains spaces
-                autostart_path = self._get_autostart_path(tray)
                 with RegistryKey(self.AUTOSTART_KEY) as key:
-                    key.set(self.AUTOSTART_NAME, ValueType.REG_SZ, autostart_path)
+                    key.set(
+                        self.AUTOSTART_NAME,
+                        ValueType.REG_SZ,
+                        self._get_autostart_path(),
+                    )
             else:
                 with RegistryKey(self.AUTOSTART_KEY) as key:
                     key.delete(self.AUTOSTART_NAME, silent=True)
         elif sys.platform == "linux":
-            autostart_folder: Path = Path("~/.config/autostart").expanduser()
-            if (config_home := os.environ.get("XDG_CONFIG_HOME")) is not None:
-                config_autostart: Path = Path(config_home, "autostart").expanduser()
-                if config_autostart.exists():
-                    autostart_folder = config_autostart
-            autostart_file: Path = autostart_folder / f"{self.AUTOSTART_NAME}.desktop"
+            autostart_file: Path = self._get_linux_autostart_filepath()
             if enabled:
-                autostart_path = self._get_autostart_path(tray)
-                file_contents = dedent(
+                file_contents: str = dedent(
                     f"""
                     [Desktop Entry]
                     Type=Application
                     Name=Twitch Drops Miner
                     Description=Mine timed drops on Twitch
-                    Exec=sh -c '{autostart_path}'
+                    Exec=sh -c '{self._get_autostart_path()}'
                     """
                 )
-                with autostart_file.open("w", encoding="utf8") as file:
+                with autostart_file.open('w', encoding="utf8") as file:
                     file.write(file_contents)
             else:
                 autostart_file.unlink(missing_ok=True)
@@ -1872,7 +1954,7 @@ class GUIManager:
         # withdraw immediately to prevent the window from flashing
         self._root.withdraw()
         # root.resizable(False, True)
-        set_root_icon(root, resource_path("pickaxe.ico"))
+        set_root_icon(root, resource_path("icons/pickaxe.ico"))
         root.title(WINDOW_TITLE)  # window title
         root.bind_all("<KeyPress-Escape>", self.unfocus)  # pressing ESC unfocuses selection
         # Image cache for displaying images
@@ -2259,6 +2341,7 @@ if __name__ == "__main__":
                 priority_only=False,
                 autostart_tray=False,
                 exclude={"Lit Game"},
+                tray_notifications=True,
             )
         )
         mock.change_state = lambda state: mock.gui.print(f"State change: {state.value}")
